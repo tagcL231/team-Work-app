@@ -2398,4 +2398,611 @@ const App = {
   renderMarketGrid() {
     const grid = document.getElementById('marketGrid');
     if (!grid) return;
-    const query = (docum
+    const query = (document.getElementById('marketSearchInput')?.value || '').toLowerCase().trim();
+    let products = this.marketState.products || [];
+    if (query) products = products.filter(p => (p.title||'').toLowerCase().includes(query) || (p.description||'').toLowerCase().includes(query));
+
+    if (!products.length) {
+      grid.style.display = 'block';
+      grid.innerHTML = `<div class="empty"><div class="empty-icon">🛒</div><h3 data-en="No products yet" data-ar="لا توجد منتجات حتى الآن">No products yet</h3><p data-en="Check back soon — new items are added regularly." data-ar="تحقق مرة أخرى قريبًا - تتم إضافة عناصر جديدة بانتظام.">Check back soon — new items are added regularly.</p></div>`;
+      Lang.updateUI();
+      return;
+    }
+    grid.style.display = 'grid';
+
+    grid.innerHTML = products.map(p => {
+      const unlocked = this.isProductUnlockedForMe(p);
+      const isAdmin = this.isAdmin();
+      const myReq = this.myRequestForProduct(p.id);
+      const thumb = (p.images && p.images[0]) ? `<img src="${p.images[0]}" alt="">` : '📦';
+
+      let statusChip = '';
+      if (isAdmin) {
+        statusChip = p.locked
+          ? `<span class="chip locked">🔒 ${Lang.t('Locked','مقفل')}</span>`
+          : `<span class="chip verified">🔓 ${Lang.t('Unlocked','مفتوح')}</span>`;
+      } else if (this.marketState.globalLock) {
+        statusChip = `<span class="chip locked">🔒 ${Lang.t('Market locked','السوق مقفل')}</span>`;
+      } else if (unlocked) {
+        statusChip = `<span class="chip verified">🔓 ${Lang.t('Unlocked','مفتوح')}</span>`;
+      } else if (myReq?.status === 'pending') {
+        statusChip = `<span class="chip pending">⏳ ${Lang.t('Pending','قيد الانتظار')}</span>`;
+      } else if (myReq?.status === 'denied') {
+        statusChip = `<span class="chip locked">❌ ${Lang.t('Denied','مرفوض')}</span>`;
+      } else {
+        statusChip = `<span class="chip neutral">🔒 ${Lang.t('Locked','مقفل')}</span>`;
+      }
+
+      return `
+        <div class="product-card" onclick="App.openProductDetail('${p.id}')">
+          <div class="pc-img">${thumb}${(!unlocked && !isAdmin) ? '<span class="pc-lock-badge">🔒</span>' : ''}</div>
+          <div class="pc-body">
+            <div class="pc-title">${this.esc(p.title)}</div>
+            <div class="pc-price">${p.price != null ? '$'+this.esc(p.price) : Lang.t('Contact for price','تواصل للسعر')}</div>
+            <div class="pc-status-chip">${statusChip}</div>
+          </div>
+        </div>`;
+    }).join('');
+    Lang.updateUI();
+  },
+
+  openProductDetail(productId) {
+    this.marketState.currentProductId = productId;
+    this.showScreen('productDetail');
+    this.renderProductDetail();
+  },
+
+  renderProductDetail() {
+    const container = document.getElementById('productDetailContent');
+    const p = this.marketState.products.find(x => String(x.id) === String(this.marketState.currentProductId));
+    if (!p) { container.innerHTML = `<div class="empty"><div class="empty-icon">❓</div><h3>${Lang.t('Product not found','المنتج غير موجود')}</h3></div>`; return; }
+
+    const unlocked = this.isProductUnlockedForMe(p);
+    const isAdmin = this.isAdmin();
+    const myReq = this.myRequestForProduct(p.id);
+    const mainImg = (p.images && p.images[0]) || null;
+
+    let actionHtml = '';
+    if (isAdmin) {
+      actionHtml = `
+        <div class="btn-row mt-12">
+          <button class="btn ${p.locked ? 'btn-success' : 'btn-outline'}" onclick="App.toggleProductLock('${p.id}', ${!p.locked})">${p.locked ? '🔓 '+Lang.t('Unlock item','فتح العنصر') : '🔒 '+Lang.t('Lock item','قفل العنصر')}</button>
+          <button class="btn btn-danger" onclick="App.deleteProduct('${p.id}')">🗑️ ${Lang.t('Remove','إزالة')}</button>
+        </div>`;
+    } else if (this.marketState.globalLock) {
+      actionHtml = `<div class="alert warn mt-12"><span class="alert-icon">🔒</span><span>${Lang.t('The whole market is locked by the admin right now. Please check back later.', 'السوق مقفل بالكامل من قبل المسؤول الآن. يرجى التحقق لاحقًا.')}</span></div>`;
+    } else if (unlocked) {
+      actionHtml = `<div class="alert success mt-12"><span class="alert-icon">✅</span><span>${Lang.t('Unlocked — you have full access to this product.', 'مفتوح - لديك وصول كامل لهذا المنتج.')}</span></div>`;
+    } else if (myReq?.status === 'pending') {
+      actionHtml = `<div class="alert warn mt-12"><span class="alert-icon">⏳</span><span>${Lang.t('Your request is awaiting admin approval.', 'طلبك في انتظار موافقة المسؤول.')}</span></div>`;
+    } else if (myReq?.status === 'denied') {
+      actionHtml = `<div class="alert danger mt-12"><span class="alert-icon">❌</span><span>${Lang.t('Your previous request was denied. You can request again.', 'تم رفض طلبك السابق. يمكنك الطلب مرة أخرى.')}</span></div>
+        <button class="btn btn-primary full mt-8" onclick="App.requestProductAccess('${p.id}')">🔓 ${Lang.t('Request access again','طلب الوصول مرة أخرى')}</button>`;
+    } else {
+      actionHtml = `<button class="btn btn-primary full mt-12" onclick="App.requestProductAccess('${p.id}')">🔓 ${Lang.t('Request access','طلب الوصول')}</button>`;
+    }
+
+    const filesHtml = (unlocked || isAdmin) && p.pdfs?.length
+      ? p.pdfs.map(f => `<div class="product-pdf-row"><span class="ppr-icon">📄</span><span>${this.esc(f.name)}</span><a href="${f.dataUrl}" download="${this.esc(f.name)}">${Lang.t('Download','تحميل')}</a></div>`).join('')
+      : ((!unlocked && !isAdmin && p.pdfs?.length) ? `<div class="alert info"><span class="alert-icon">🔒</span><span>${Lang.t('Documents unlock after your request is approved.', 'تُفتح الوثائق بعد الموافقة على طلبك.')}</span></div>` : '');
+
+    const thumbsHtml = (p.images && p.images.length > 1)
+      ? `<div class="product-detail-thumbs">${p.images.map(img=>`<img src="${img}" onclick="document.getElementById('pdMainImg').src='${img}'">`).join('')}</div>`
+      : '';
+
+    container.innerHTML = `
+      <div class="product-detail-img">${mainImg ? `<img id="pdMainImg" src="${mainImg}">` : '📦'}</div>
+      ${thumbsHtml}
+      <h2 style="font-size:20px;margin-bottom:6px">${this.esc(p.title)}</h2>
+      <div class="pc-price" style="margin-bottom:12px">${p.price != null ? '$'+this.esc(p.price) : Lang.t('Contact for price','تواصل للسعر')}</div>
+      <p style="font-size:13.5px;color:var(--ink-500);line-height:1.7;margin-bottom:14px">${this.esc(p.description || '')}</p>
+      ${filesHtml}
+      ${actionHtml}
+    `;
+    Lang.updateUI();
+  },
+
+  async requestProductAccess(productId) {
+    try {
+      await Api.marketRequestAccess(productId).catch(() => {
+        // demo-mode fallback
+        const existing = Store._marketRequests.find(r => r.productId === productId && r.userId === this.user?.id && r.status === 'pending');
+        if (!existing) {
+          Store._marketRequests.push({
+            id: 'req_' + Date.now(),
+            productId, userId: this.user?.id,
+            userName: `${this.user?.firstName||''} ${this.user?.lastName||''}`.trim(),
+            status: 'pending', createdAt: new Date().toISOString(),
+          });
+          Store.saveMarketRequests();
+        }
+      });
+      await this.loadMarketData();
+      this.renderProductDetail();
+      alert(Lang.t('Request sent! An admin will review it shortly.', 'تم إرسال الطلب! سيقوم المسؤول بمراجعته قريبًا.'));
+    } catch(e) {
+      alert(Lang.t('Error:','خطأ:') + ' ' + e.message);
+    }
+  },
+
+  async toggleProductLock(productId, locked) {
+    try {
+      await Api.marketSetLock(productId, locked).catch(() => {
+        const p = Store._products.find(x => String(x.id) === String(productId));
+        if (p) { p.locked = locked; Store.saveProducts(); }
+      });
+      await this.loadMarketData();
+      this.renderProductDetail();
+      this.renderMarketGrid();
+    } catch(e) {
+      alert(Lang.t('Error:','خطأ:') + ' ' + e.message);
+    }
+  },
+
+  async toggleGlobalMarketLock(locked) {
+    try {
+      await Api.marketSetGlobalLock(locked).catch(() => {
+        Store._marketGlobalLock = locked;
+        Store.saveGlobalLock();
+      });
+      this.marketState.globalLock = locked;
+      this.renderMarketScreen();
+    } catch(e) {
+      alert(Lang.t('Error:','خطأ:') + ' ' + e.message);
+      const toggle = document.getElementById('marketGlobalLockToggle');
+      if (toggle) toggle.checked = !locked;
+    }
+  },
+
+  async deleteProduct(productId) {
+    if (!confirm(Lang.t('Remove this product permanently?', 'إزالة هذا المنتج بشكل نهائي؟'))) return;
+    try {
+      await Api.marketDeleteProduct(productId).catch(() => {
+        Store._products = Store._products.filter(x => String(x.id) !== String(productId));
+        Store.saveProducts();
+      });
+      await this.loadMarketData();
+      this.showScreen('market');
+    } catch(e) {
+      alert(Lang.t('Error:','خطأ:') + ' ' + e.message);
+    }
+  },
+
+  // ─── Admin: add product sheet ────────────────────
+  initMarketAddProductForm() {
+    this.marketState.pendingPhotoDataUrl = [];
+    this.marketState.pendingPdfFiles = [];
+    this.renderPendingProductMedia();
+  },
+
+  handleProductImageSelect(evt) {
+    const files = Array.from(evt.target.files || []);
+    files.forEach(file => {
+      if (!file.type.startsWith('image/')) return;
+      if (file.size > 6 * 1024 * 1024) { alert(Lang.t('Each image must be smaller than 6MB.','يجب أن تكون كل صورة أصغر من 6 ميجابايت.')); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        this.marketState.pendingPhotoDataUrl.push(reader.result);
+        this.renderPendingProductMedia();
+      };
+      reader.readAsDataURL(file);
+    });
+    evt.target.value = '';
+  },
+
+  handleProductPdfSelect(evt) {
+    const files = Array.from(evt.target.files || []);
+    files.forEach(file => {
+      if (file.type !== 'application/pdf') { alert(Lang.t('Only PDF files are allowed here.','يُسمح فقط بملفات PDF هنا.')); return; }
+      if (file.size > 15 * 1024 * 1024) { alert(Lang.t('Each PDF must be smaller than 15MB.','يجب أن يكون كل PDF أصغر من 15 ميجابايت.')); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        this.marketState.pendingPdfFiles.push({ name: file.name, dataUrl: reader.result });
+        this.renderPendingProductMedia();
+      };
+      reader.readAsDataURL(file);
+    });
+    evt.target.value = '';
+  },
+
+  removePendingImage(idx) {
+    this.marketState.pendingPhotoDataUrl.splice(idx, 1);
+    this.renderPendingProductMedia();
+  },
+
+  removePendingPdf(idx) {
+    this.marketState.pendingPdfFiles.splice(idx, 1);
+    this.renderPendingProductMedia();
+  },
+
+  renderPendingProductMedia() {
+    const imgWrap = document.getElementById('productImgThumbs');
+    if (imgWrap) {
+      imgWrap.innerHTML = this.marketState.pendingPhotoDataUrl.map((src, i) =>
+        `<div class="upload-thumb"><img src="${src}"><button class="ut-remove" onclick="App.removePendingImage(${i})">✕</button></div>`
+      ).join('');
+    }
+    const pdfWrap = document.getElementById('productPdfChips');
+    if (pdfWrap) {
+      pdfWrap.innerHTML = this.marketState.pendingPdfFiles.map((f, i) =>
+        `<div class="upload-file-chip"><span>📄 ${this.esc(f.name)}</span><span class="ufc-remove" onclick="App.removePendingPdf(${i})">✕ ${Lang.t('Remove','إزالة')}</span></div>`
+      ).join('');
+    }
+  },
+
+  async submitNewProduct() {
+    const title = document.getElementById('prodTitle')?.value?.trim();
+    const price = document.getElementById('prodPrice')?.value?.trim();
+    const desc = document.getElementById('prodDesc')?.value?.trim();
+    const err = document.getElementById('prodErr');
+    const btn = document.querySelector('[onclick="App.submitNewProduct()"]');
+
+    if (!title) { this.showMsg('prodErr', 'danger', Lang.t('Product title is required', 'عنوان المنتج مطلوب')); return; }
+
+    const payload = {
+      title, description: desc || '',
+      price: price ? Number(price) : null,
+      images: this.marketState.pendingPhotoDataUrl.slice(),
+      pdfs: this.marketState.pendingPdfFiles.slice(),
+      locked: false,
+    };
+
+    this.setBtnLoad(btn, true, Lang.t('Publishing…', 'جاري النشر...'));
+    try {
+      await Api.marketCreateProduct(payload).catch(() => {
+        Store._products.push({ id: 'prod_' + Date.now(), ...payload, createdAt: new Date().toISOString() });
+        Store.saveProducts();
+      });
+      await this.loadMarketData();
+      this.closeSheet();
+      this.showScreen('market');
+    } catch(e) {
+      this.showMsg('prodErr', 'danger', e.message);
+    } finally {
+      this.setBtnLoad(btn, false);
+    }
+  },
+
+  // ─── Admin: market purchase requests sheet ───────
+  async loadMarketRequestsSheet() {
+    const container = document.getElementById('sheet');
+    if (!container) return;
+    container.innerHTML = `
+      <div class="sheet-pill"></div>
+      <h2 data-en="📥 Purchase Requests" data-ar="📥 طلبات الشراء">📥 Purchase Requests</h2>
+      <p class="sheet-sub" data-en="Approve to unlock a product for that user, or deny to keep it locked." data-ar="وافق لفتح منتج لهذا المستخدم، أو رفض لإبقائه مقفلاً.">Approve to unlock a product for that user, or deny to keep it locked.</p>
+      <div id="marketReqList"></div>
+    `;
+    Lang.updateUI();
+    await this.loadMarketData();
+    const list = document.getElementById('marketReqList');
+    const reqs = this.marketState.requests || [];
+    if (!reqs.length) {
+      list.innerHTML = `<div class="empty" style="padding:24px"><div class="empty-icon">📭</div><h3>${Lang.t('No requests yet','لا توجد طلبات حتى الآن')}</h3></div>`;
+      return;
+    }
+    list.innerHTML = reqs.map(r => {
+      const product = this.marketState.products.find(p => String(p.id) === String(r.productId));
+      const statusClass = r.status === 'pending' ? 'pending' : r.status === 'approved' ? 'approved' : 'pending';
+      return `
+        <div class="market-request-card">
+          <div class="mrc-header">
+            <span class="mrc-product">${this.esc(product?.title || Lang.t('Unknown product','منتج غير معروف'))}</span>
+            <span class="prc-status ${statusClass}">${this.esc(r.status)}</span>
+          </div>
+          <div class="mrc-meta">${this.esc(r.userName||'')} · ${new Date(r.createdAt).toLocaleString()}</div>
+          ${r.status === 'pending' ? `
+            <div class="mrc-actions">
+              <button class="btn btn-sm btn-success" onclick="App.approveMarketRequest('${r.id}')">✅ ${Lang.t('Approve','موافقة')}</button>
+              <button class="btn btn-sm btn-outline" onclick="App.denyMarketRequest('${r.id}')">❌ ${Lang.t('Deny','رفض')}</button>
+            </div>` : ''}
+        </div>`;
+    }).join('');
+    Lang.updateUI();
+  },
+
+  async approveMarketRequest(reqId) {
+    try {
+      await Api.marketApproveRequest(reqId).catch(() => {
+        const r = Store._marketRequests.find(x => String(x.id) === String(reqId));
+        if (r) { r.status = 'approved'; Store.saveMarketRequests(); }
+      });
+      this.loadMarketRequestsSheet();
+    } catch(e) { alert(Lang.t('Error:','خطأ:') + ' ' + e.message); }
+  },
+
+  async denyMarketRequest(reqId) {
+    try {
+      await Api.marketDenyRequest(reqId).catch(() => {
+        const r = Store._marketRequests.find(x => String(x.id) === String(reqId));
+        if (r) { r.status = 'denied'; Store.saveMarketRequests(); }
+      });
+      this.loadMarketRequestsSheet();
+    } catch(e) { alert(Lang.t('Error:','خطأ:') + ' ' + e.message); }
+  },
+
+  // ─── ADMIN: USERS ────────────────────────────────
+  async loadAdminUsers() {
+    const container = document.getElementById('sheet');
+    if (!container) return;
+    container.innerHTML = `
+      <div class="sheet-pill"></div>
+      <h2 data-en="All Users" data-ar="جميع المستخدمين">All Users</h2>
+      <p class="sheet-sub" data-en="View customer information and reset passwords" data-ar="عرض معلومات العملاء وإعادة تعيين كلمات المرور">View customer information and reset passwords</p>
+      <div id="adminUsersList"></div>
+    `;
+    Lang.updateUI();
+
+    try {
+      const {users} = await Api.adminUsers();
+      const list = document.getElementById('adminUsersList');
+      if (!users || users.length === 0) {
+        list.innerHTML = `<div class="empty" style="padding:24px"><div class="empty-icon">👥</div><h3>${Lang.t('No users', 'لا يوجد مستخدمون')}</h3></div>`;
+        return;
+      }
+
+      list.innerHTML = users.map(u => `
+        <div class="admin-user-card">
+          <div class="auc-header">
+            <div class="auc-avatar">${this.initials(u)}</div>
+            <div class="auc-info">
+              <div class="auc-name">${this.esc(u.firstName)} ${this.esc(u.lastName)}</div>
+              <div class="auc-role">${u.role} • ${u.verified ? Lang.t('Verified', 'موثق') : Lang.t('Pending', 'قيد الانتظار')}</div>
+            </div>
+          </div>
+          <div class="auc-body">
+            <div><strong>${Lang.t('Email:', 'البريد الإلكتروني:')} </strong>${this.esc(u.email)}</div>
+            <div><strong>${Lang.t('Phone:', 'الهاتف:')} </strong>${this.esc(u.phone || '—')}</div>
+            <div><strong>${Lang.t('Location:', 'الموقع:')} </strong>${this.esc(u.city)}, ${this.esc(u.country)}</div>
+            ${u.role === 'worker' ? `<div><strong>${Lang.t('Skill:', 'المهارة:')} </strong>${this.esc(u.primarySkill || '—')}</div>` : ''}
+            <div><strong>${Lang.t('Joined:', 'انضم:')} </strong>${new Date(u.createdAt).toLocaleDateString()}</div>
+          </div>
+          <div class="auc-actions">
+            <button class="btn btn-sm btn-primary" onclick="App.resetUserPasswordUI(${u.id})">${Lang.t('🔑 Reset Password', '🔑 إعادة تعيين كلمة المرور')}</button>
+          </div>
+        </div>
+      `).join('');
+    } catch(e) {
+      const list = document.getElementById('adminUsersList');
+      if (list) list.innerHTML = `<div class="alert danger"><span class="alert-icon">❌</span><span>${this.esc(e.message)}</span></div>`;
+    }
+  },
+
+  resetUserPasswordUI(userId) {
+    const input = prompt(Lang.t('Enter new password for this user (min 8 characters):', 'أدخل كلمة المرور الجديدة لهذا المستخدم (8 أحرف على الأقل):'));
+    if (!input || input.length < 8) {
+      alert(Lang.t('Password must be at least 8 characters', 'يجب أن تكون كلمة المرور 8 أحرف على الأقل'));
+      return;
+    }
+    this.adminResetUserPassword(userId, input);
+  },
+
+  async adminResetUserPassword(userId, newPassword) {
+    try {
+      await Api.adminResetUserPassword(userId, newPassword);
+      alert(Lang.t('Password reset successfully', 'تم إعادة تعيين كلمة المرور بنجاح'));
+      this.loadAdminUsers();
+    } catch(e) {
+      alert(Lang.t('Error:', 'خطأ:') + ' ' + e.message);
+    }
+  },
+
+  // ─── ADMIN: PASSWORD RESET REQUESTS (PRP) ────────
+  async loadAdminPasswordRequests() {
+    const container = document.getElementById('sheet');
+    if (!container) return;
+    container.innerHTML = `
+      <div class="sheet-pill"></div>
+      <h2 data-en="🔑 Password Reset Portal (PRP)" data-ar="🔑 بوابة إعادة تعيين كلمة المرور (PRP)">🔑 Password Reset Portal (PRP)</h2>
+      <p class="sheet-sub" data-en="Verify and approve customer password reset requests" data-ar="التحقق من طلبات إعادة تعيين كلمة المرور للعملاء والموافقة عليها">Verify and approve customer password reset requests</p>
+      <div id="adminPwdReqList"></div>
+    `;
+    Lang.updateUI();
+
+    try {
+      const {requests} = await Api.adminPasswordRequests();
+      const list = document.getElementById('adminPwdReqList');
+      
+      if (!requests || requests.length === 0) {
+        list.innerHTML = `<div class="empty" style="padding:24px"><div class="empty-icon">✅</div><h3>${Lang.t('No pending requests', 'لا توجد طلبات معلقة')}</h3></div>`;
+        return;
+      }
+
+      const pending = requests.filter(r => r.status === 'pending');
+      const approved = requests.filter(r => r.status === 'approved');
+
+      let html = '';
+
+      if (pending.length > 0) {
+        html += `<div style="margin-bottom:20px"><h3 style="font-size:14px;margin-bottom:10px;font-weight:700">${Lang.t('⏳ Pending Verification', '⏳ قيد التحقق')}</h3>`;
+        html += pending.map(r => `
+          <div class="pwd-req-card">
+            <div class="prc-header">
+              <span class="prc-status pending">${Lang.t('Pending', 'معلق')}</span>
+              <span class="prc-user">${this.esc(r.userName)}</span>
+            </div>
+            <div class="prc-email">${this.esc(r.email)}</div>
+            <div class="prc-time">${Lang.t('Requested:', 'طلب:')} ${new Date(r.createdAt).toLocaleString()}</div>
+            <div class="prc-pass"><strong>${Lang.t('Temp Password:', 'كلمة مرور مؤقتة:')} </strong><code>${this.esc(r.newPassword)}</code></div>
+            <div class="prc-actions">
+              <button class="btn btn-sm btn-success" onclick="App.adminApprovePasswordReset(${r.id})">${Lang.t('✅ Approve', '✅ موافقة')}</button>
+              <button class="btn btn-sm btn-outline" onclick="App.adminDenyPasswordReset(${r.id})">${Lang.t('❌ Deny', '❌ رفض')}</button>
+            </div>
+          </div>
+        `).join('');
+        html += '</div>';
+      }
+
+      if (approved.length > 0) {
+        html += `<div><h3 style="font-size:14px;margin-bottom:10px;font-weight:700">${Lang.t('✅ Approved', '✅ موافق عليه')}</h3>`;
+        html += approved.map(r => `
+          <div class="pwd-req-card" style="opacity:.7">
+            <div class="prc-header">
+              <span class="prc-status approved">${Lang.t('Approved', 'موافق عليه')}</span>
+              <span class="prc-user">${this.esc(r.userName)}</span>
+            </div>
+            <div class="prc-email">${this.esc(r.email)}</div>
+            <div class="prc-time">${Lang.t('Approved:', 'موافق عليه:')} ${new Date(r.approvedAt).toLocaleString()}</div>
+          </div>
+        `).join('');
+        html += '</div>';
+      }
+
+      list.innerHTML = html;
+      Lang.updateUI();
+    } catch(e) {
+      const list = document.getElementById('adminPwdReqList');
+      if (list) list.innerHTML = `<div class="alert danger"><span class="alert-icon">❌</span><span>${this.esc(e.message)}</span></div>`;
+    }
+  },
+
+  async adminApprovePasswordReset(reqId) {
+    if (!confirm(Lang.t('Approve this password reset request? User will be notified and can log in with the new password.', 'موافقة على طلب إعادة تعيين كلمة المرور هذا؟ سيتم إخطار المستخدم ويمكنه تسجيل الدخول باستخدام كلمة المرور الجديدة.'))) return;
+    try {
+      await Api.adminApprovePasswordReset(reqId);
+      alert(Lang.t('Password reset approved! User has been notified.', 'تم الموافقة على إعادة تعيين كلمة المرور! تم إخطار المستخدم.'));
+      this.loadAdminPasswordRequests();
+    } catch(e) {
+      alert(Lang.t('Error:', 'خطأ:') + ' ' + e.message);
+    }
+  },
+
+  async adminDenyPasswordReset(reqId) {
+    if (!confirm(Lang.t('Deny this password reset request?', 'رفض طلب إعادة تعيين كلمة المرور هذا؟'))) return;
+    try {
+      await Api.adminDenyPasswordReset(reqId);
+      alert(Lang.t('Request denied.', 'تم رفض الطلب.'));
+      this.loadAdminPasswordRequests();
+    } catch(e) {
+      alert(Lang.t('Error:', 'خطأ:') + ' ' + e.message);
+    }
+  },
+
+  // ─── SHEET HTML ──────────────────────────────────
+  sheetHTML(name, ctx) {
+    if (name === 'login') return `
+      <div class="sheet-pill"></div>
+      <h2 data-en="Welcome back" data-ar="أهلا بعودتك">Welcome back</h2>
+      <p class="sheet-sub" data-en="Log in with your email or phone number." data-ar="قم بتسجيل الدخول باستخدام بريدك الإلكتروني أو رقم هاتفك.">Log in with your email or phone number.</p>
+      <div class="form-group"><label class="form-label" data-en="Email or phone" data-ar="البريد الإلكتروني أو الهاتف">Email or phone</label>
+        <div class="input-wrap"><span class="input-icon">👤</span><input id="liId" data-en-placeholder="your@email.com" data-ar-placeholder="your@email.com" placeholder="your@email.com"></div></div>
+      <div class="form-group"><label class="form-label" data-en="Password" data-ar="كلمة المرور">Password</label>
+        <div class="input-wrap"><span class="input-icon">🔑</span><input id="liPass" type="password" data-en-placeholder="••••••••" data-ar-placeholder="••••••••" placeholder="••••••••"></div></div>
+      <div id="liErr"></div>
+      <button class="btn btn-primary full" id="liBtn" onclick="App.doLogin()" data-en="Log in" data-ar="تسجيل الدخول">Log in</button>
+      <p class="text-center mt-12"><button class="btn-ghost" onclick="App.openForgotPasswordSheet()" data-en="🔑 Forgot password?" data-ar="🔑 هل نسيت كلمة المرور؟">🔑 Forgot password?</button></p>
+      <p class="text-center mt-8"><button class="btn-ghost" onclick="App.openSheet('register')" data-en="No account yet? Create one →" data-ar="ليس لديك حساب؟ أنشئ واحدًا →">No account yet? Create one →</button></p>`;
+
+    if (name === 'forgotPassword') return `
+      <div class="sheet-pill"></div>
+      <h2 data-en="Reset your password" data-ar="إعادة تعيين كلمتك المرور">Reset your password</h2>
+      <p class="sheet-sub" data-en="Enter your email and a new password. An admin will verify your request and activate it." data-ar="أدخل بريدك الإلكتروني وكلمة مرور جديدة. سيتحقق المسؤول من طلبك وتفعيله.">Enter your email and a new password. An admin will verify your request and activate it.</p>
+      <div class="form-group"><label class="form-label" data-en="Email address" data-ar="عنوان البريد الإلكتروني">Email address</label>
+        <input id="fpEmail" type="email" data-en-placeholder="you@example.com" data-ar-placeholder="you@example.com" placeholder="you@example.com"></div>
+      <div class="form-group"><label class="form-label" data-en="New password" data-ar="كلمة مرور جديدة">New password</label>
+        <input id="fpNewPass" type="password" data-en-placeholder="Min 8 characters" data-ar-placeholder="8 أحرف على الأقل" placeholder="Min 8 characters"></div>
+      <div class="form-group"><label class="form-label" data-en="Confirm password" data-ar="تأكيد كلمة المرور">Confirm password</label>
+        <input id="fpConfirmPass" type="password" data-en-placeholder="Re-enter password" data-ar-placeholder="أعد إدخال كلمة المرور" placeholder="Re-enter password"></div>
+      <div id="fpErr"></div>
+      <button class="btn btn-primary full" onclick="App.submitForgotPassword()" data-en="Submit reset request" data-ar="إرسال طلب إعادة التعيين">Submit reset request</button>
+      <p class="text-center mt-12"><button class="btn-ghost" onclick="App.closeSheet()" data-en="← Back to login" data-ar="← العودة إلى تسجيل الدخول">← Back to login</button></p>`;
+
+    if (name === 'register') return `
+      <div class="sheet-pill"></div>
+      <h2 data-en="Create account" data-ar="إنشاء حساب">Create account</h2>
+      <p class="sheet-sub" data-en="Joining takes about a minute." data-ar="الانضمام يستغرق حوالي دقيقة واحدة.">Joining takes about a minute.</p>
+      <div class="form-group"><label class="form-label" data-en="I am a" data-ar="أنا">I am a</label>
+        <select id="regRole">
+          <option value="worker" data-en="👷 Worker — looking for jobs" data-ar="👷 عامل — يبحث عن وظائف">Worker</option>
+          <option value="employer" data-en="🏢 Employer — hiring workers" data-ar="🏢 صاحب عمل — توظيف عمال">Employer</option>
+        </select></div>
+      <div class="btn-row">
+        <div class="form-group"><label class="form-label" data-en="First name" data-ar="الاسم الأول">First name</label><input id="regFirst" data-en-placeholder="Ahmed" data-ar-placeholder="أحمد" placeholder="Ahmed"></div>
+        <div class="form-group"><label class="form-label" data-en="Last name" data-ar="اسم العائلة">Last name</label><input id="regLast" data-en-placeholder="Hassan" data-ar-placeholder="حسن" placeholder="Hassan"></div>
+      </div>
+      <div class="form-group"><label class="form-label" data-en="Country" data-ar="الدولة">Country</label><select id="regCountry"></select></div>
+      <div class="form-group"><label class="form-label" data-en="City" data-ar="مدينة">City</label><input id="regCity" data-en-placeholder="Cairo" data-ar-placeholder="القاهرة" placeholder="Cairo"></div>
+      <div class="form-group"><label class="form-label" data-en="Date of birth" data-ar="تاريخ الميلاد">Date of birth</label><input type="date" id="regDob"></div>
+      <div class="form-group"><label class="form-label" data-en="Email" data-ar="بريد إلكتروني">Email</label><input type="email" id="regEmail" data-en-placeholder="you@email.com" data-ar-placeholder="you@email.com" placeholder="you@email.com"></div>
+      <div class="form-group"><label class="form-label" data-en="Password" data-ar="كلمة المرور">Password</label><input type="password" id="regPass" data-en-placeholder="Min 8 characters" data-ar-placeholder="8 أحرف على الأقل" placeholder="Min 8 characters"></div>
+      <div id="workerFields">
+        <div class="form-group"><label class="form-label" data-en="Primary skill" data-ar="المهارة الأساسية">Primary skill</label><select id="regSkill"></select></div>
+      </div>
+      <div id="regErr"></div>
+      <button class="btn btn-primary full" onclick="App.doRegister()" data-en="Create account" data-ar="إنشاء حساب">Create account</button>
+      <p class="text-center mt-12"><button class="btn-ghost" onclick="App.openSheet('login')" data-en="Already have an account? Log in →" data-ar="هل لديك حساب بالفعل؟ تسجيل الدخول →">Already have an account? Log in →</button></p>`;
+
+    if (name === 'marketAddProduct') return `
+      <div class="sheet-pill"></div>
+      <h2 data-en="➕ Add product" data-ar="➕ إضافة منتج">➕ Add product</h2>
+      <p class="sheet-sub" data-en="Visible to everyone, but locked until you approve access for non-admins." data-ar="مرئي للجميع، لكنه مقفل حتى توافق على الوصول لغير المسؤولين.">Visible to everyone, but locked until you approve access for non-admins.</p>
+      <div class="form-group"><label class="form-label" data-en="Title" data-ar="العنوان">Title</label>
+        <input id="prodTitle" data-en-placeholder="e.g. Pro Photography Lighting Kit" data-ar-placeholder="مثل طقم إضاءة تصوير محترف" placeholder="e.g. Pro Photography Lighting Kit"></div>
+      <div class="form-group"><label class="form-label" data-en="Price (USD, optional)" data-ar="السعر (دولار، اختياري)">Price (USD, optional)</label>
+        <input id="prodPrice" type="number" min="0" step="0.01" data-en-placeholder="e.g. 199" data-ar-placeholder="مثل 199" placeholder="e.g. 199"></div>
+      <div class="form-group"><label class="form-label" data-en="Description" data-ar="الوصف">Description</label>
+        <textarea id="prodDesc" rows="3" data-en-placeholder="Describe the product…" data-ar-placeholder="صف المنتج..." placeholder="Describe the product…"></textarea></div>
+      <div class="form-group">
+        <label class="form-label" data-en="Product images" data-ar="صور المنتج">Product images</label>
+        <div class="upload-drop" onclick="document.getElementById('prodImgInput').click()">
+          <span class="ud-icon">🖼️</span>
+          <span class="ud-text" data-en="Tap to upload images" data-ar="اضغط لتحميل الصور">Tap to upload images</span>
+          <span class="ud-sub" data-en="JPG/PNG, multiple allowed" data-ar="JPG/PNG، يُسمح بعدة صور">JPG/PNG, multiple allowed</span>
+        </div>
+        <input type="file" id="prodImgInput" accept="image/*" multiple class="hidden" onchange="App.handleProductImageSelect(event)">
+        <div class="upload-thumb-row" id="productImgThumbs"></div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" data-en="Product PDFs (manuals, specs…)" data-ar="ملفات PDF للمنتج (دليل، مواصفات...)">Product PDFs (manuals, specs…)</label>
+        <div class="upload-drop" onclick="document.getElementById('prodPdfInput').click()">
+          <span class="ud-icon">📄</span>
+          <span class="ud-text" data-en="Tap to upload PDF files" data-ar="اضغط لتحميل ملفات PDF">Tap to upload PDF files</span>
+          <span class="ud-sub" data-en="PDF only, multiple allowed" data-ar="PDF فقط، يُسمح بعدة ملفات">PDF only, multiple allowed</span>
+        </div>
+        <input type="file" id="prodPdfInput" accept="application/pdf" multiple class="hidden" onchange="App.handleProductPdfSelect(event)">
+        <div id="productPdfChips"></div>
+      </div>
+      <div id="prodErr"></div>
+      <button class="btn btn-primary full" onclick="App.submitNewProduct()" data-en="📤 Publish product" data-ar="📤 نشر المنتج">📤 Publish product</button>`;
+
+    return '';
+  },
+
+  setContactCat(cat, btn) {
+    this.contactCategory = cat;
+    document.querySelectorAll('#contactToggle button').forEach(b => b.classList.toggle('active', b === btn));
+  },
+
+  async submitContact() {
+    const body = document.getElementById('contactBody')?.value?.trim();
+    const btn = document.querySelector('[onclick="App.submitContact()"]');
+    if (!body) {
+      this.showMsg('contactMsg', 'danger', Lang.t('Please enter a message', 'يرجى إدخال رسالة'));
+      return;
+    }
+    this.setBtnLoad(btn, true);
+    try {
+      const response = await Api.req('/messages', {method:'POST', body:{category: this.contactCategory, body}});
+      this.showMsg('contactMsg', 'success', Lang.t('Message sent! We will respond soon.', 'تم إرسال الرسالة! سنرد قريبًا.'));
+      if (document.getElementById('contactBody')) document.getElementById('contactBody').value = '';
+    } catch(e) {
+      this.showMsg('contactMsg', 'danger', e.message);
+    } finally {
+      this.setBtnLoad(btn, false);
+    }
+  },
+};
+
+function bootApp() {
+  if (window.__fbReady && window.FB) { App.init(); return; }
+  let booted = false;
+  window.addEventListener('fb-ready', () => { if(!booted){ booted=true; App.init(); } }, { once:true });
+  // Safety net: if the Firebase module script fails to load (e.g. blocked network),
+  // still boot the app after 4s so the UI isn't stuck forever.
+  setTimeout(() => { if(!booted){ booted=true; console.warn('Firebase did not become ready in time; booting without it.'); App.init(); } }, 4000);
+}
+document.addEventListener('DOMContentLoaded', bootApp);
+</script>
+
+</body>
+   </html>
