@@ -1490,11 +1490,16 @@ document.addEventListener('DOMContentLoaded', () => Door.init());
         </div>
         <label class="toggle-wrap"><input type="checkbox" id="marketGlobalLockToggle" onchange="App.toggleGlobalMarketLock(this.checked)"><span class="toggle-track"></span></label>
       </div>
-      <div class="admin-action-row" style="grid-template-columns:1fr;padding:0;margin-bottom:12px">
+      <div class="admin-action-row" style="padding:0;margin-bottom:12px">
         <button class="admin-action-btn" onclick="App.openSheet('marketRequests')">
           <span class="aab-icon">📥</span>
           <span class="aab-label" data-en="Purchase Requests" data-ar="طلبات الشراء">Purchase Requests</span>
           <span class="aab-sub" data-en="Review & approve/lock" data-ar="مراجعة والموافقة/القفل">Review & approve/lock</span>
+        </button>
+        <button class="admin-action-btn" onclick="App.openSheet('marketPaymentSettings')">
+          <span class="aab-icon">💳</span>
+          <span class="aab-label" data-en="Payment Settings" data-ar="إعدادات الدفع">Payment Settings</span>
+          <span class="aab-sub" data-en="Wallet number shown to clients" data-ar="رقم المحفظة المعروض للعملاء">Wallet number shown to clients</span>
         </button>
       </div>
     </div>
@@ -1881,7 +1886,16 @@ const Api = {
     const snap = await getDocs(collection(db, 'marketProducts'));
     const products = snap.docs.map(d => ({ ...d.data(), id: d.id }));
     const lockSnap = await this.fb().getDoc(this.fb().doc(db, 'marketConfig', 'global'));
-    products.globalLock = lockSnap.exists() ? !!lockSnap.data().locked : false;
+    const lockData = lockSnap.exists() ? lockSnap.data() : {};
+    products.globalLock = !!lockData.locked;
+    // Payment wallet info shown to clients before they pay & submit proof.
+    // Admin edits this directly in Firestore (marketConfig/global doc):
+    // walletMethod (e.g. "Vodafone Cash"), walletNumber, walletName.
+    products.walletInfo = {
+      method: lockData.walletMethod || 'Mobile Wallet',
+      number: lockData.walletNumber || Lang.t('Not set yet — ask the admin', 'لم يتم تعيينه بعد - اسأل المسؤول'),
+      name: lockData.walletName || '',
+    };
     return { products };
   },
 
@@ -1909,7 +1923,17 @@ const Api = {
     return { ok: true };
   },
 
-  async marketRequestAccess(productId) {
+  async marketSetWalletInfo({ method, number, name }) {
+    const { db, doc, setDoc } = this.fb();
+    await setDoc(doc(db, 'marketConfig', 'global'), {
+      walletMethod: method || null,
+      walletNumber: number || null,
+      walletName: name || null,
+    }, { merge: true });
+    return { ok: true };
+  },
+
+  async marketRequestAccess(productId, proof) {
     const { db, collection, addDoc, serverTimestamp, auth } = this.fb();
     const user = App.user;
     await addDoc(collection(db, 'marketRequests'), {
@@ -1917,6 +1941,9 @@ const Api = {
       userId: user?.id || auth.currentUser?.uid || null,
       userName: `${user?.firstName||''} ${user?.lastName||''}`.trim(),
       status: 'pending',
+      paymentProofImage: proof?.image || null,
+      paymentAmount: proof?.amount || null,
+      paymentNote: proof?.note || null,
       createdAt: serverTimestamp(),
     });
     return { ok: true };
@@ -1998,6 +2025,8 @@ const App = {
     currentProductId: null,
     pendingPhotoDataUrl: [],
     pendingPdfFiles: [],
+    walletInfo: { method: 'Mobile Wallet', number: '', name: '' },
+    pendingProof: {},
   },
   cvPhotoDataUrl: null,
 
@@ -2098,6 +2127,7 @@ const App = {
       adminMessages: ()=>{},
       adminJobs: ()=>{},
       marketAddProduct: ()=>this.initMarketAddProductForm(),
+      marketPaymentSettings: ()=>{},
       marketRequests: ()=>this.loadMarketRequestsSheet(),
     };
     after[name]?.(ctx);
@@ -2353,13 +2383,18 @@ const App = {
         Api.marketProducts().catch(()=>({products:null})),
         this.isAdmin() ? Api.marketRequests().catch(()=>({requests:null})) : Promise.resolve({requests:null}),
       ]);
-      this.marketState.products = products && Array.isArray(products) ? products : Store._products;
+      const gotProducts = products && Array.isArray(products);
+      this.marketState.products = gotProducts ? products : Store._products;
       this.marketState.requests = requestsRes.requests && Array.isArray(requestsRes.requests) ? requestsRes.requests : Store._marketRequests;
-      this.marketState.globalLock = (products && products.length) ? !!products.globalLock : Store._marketGlobalLock;
+      // Read globalLock/walletInfo off the array itself (set by Api.marketProducts)
+      // regardless of how many products exist — an empty market must still be lockable.
+      this.marketState.globalLock = gotProducts ? !!products.globalLock : Store._marketGlobalLock;
+      this.marketState.walletInfo = gotProducts ? (products.walletInfo || {}) : { method: 'Mobile Wallet', number: '', name: '' };
     } catch(_) {
       this.marketState.products = Store._products;
       this.marketState.requests = Store._marketRequests;
       this.marketState.globalLock = Store._marketGlobalLock;
+      this.marketState.walletInfo = { method: 'Mobile Wallet', number: '', name: '' };
     }
   },
 
@@ -2474,12 +2509,14 @@ const App = {
     } else if (unlocked) {
       actionHtml = `<div class="alert success mt-12"><span class="alert-icon">✅</span><span>${Lang.t('Unlocked — you have full access to this product.', 'مفتوح - لديك وصول كامل لهذا المنتج.')}</span></div>`;
     } else if (myReq?.status === 'pending') {
-      actionHtml = `<div class="alert warn mt-12"><span class="alert-icon">⏳</span><span>${Lang.t('Your request is awaiting admin approval.', 'طلبك في انتظار موافقة المسؤول.')}</span></div>`;
+      actionHtml = `
+        <div class="alert warn mt-12"><span class="alert-icon">⏳</span><span>${Lang.t('Your payment proof was submitted and is awaiting admin verification.', 'تم إرسال إثبات الدفع وهو في انتظار تحقق المسؤول.')}</span></div>
+        ${myReq.paymentProofImage ? `<img src="${myReq.paymentProofImage}" style="width:100%;border-radius:var(--r-md);margin-top:8px;border:1px solid var(--cream-200)">` : ''}`;
     } else if (myReq?.status === 'denied') {
-      actionHtml = `<div class="alert danger mt-12"><span class="alert-icon">❌</span><span>${Lang.t('Your previous request was denied. You can request again.', 'تم رفض طلبك السابق. يمكنك الطلب مرة أخرى.')}</span></div>
-        <button class="btn btn-primary full mt-8" onclick="App.requestProductAccess('${p.id}')">🔓 ${Lang.t('Request access again','طلب الوصول مرة أخرى')}</button>`;
+      actionHtml = `<div class="alert danger mt-12"><span class="alert-icon">❌</span><span>${Lang.t("Your payment couldn't be verified. Please check the amount/proof and try again.", 'تعذر التحقق من دفعتك. يرجى التحقق من المبلغ/الإثبات والمحاولة مرة أخرى.')}</span></div>
+        ${this.paymentProofFormHtml(p)}`;
     } else {
-      actionHtml = `<button class="btn btn-primary full mt-12" onclick="App.requestProductAccess('${p.id}')">🔓 ${Lang.t('Request access','طلب الوصول')}</button>`;
+      actionHtml = this.paymentProofFormHtml(p);
     }
 
     const filesHtml = (unlocked || isAdmin) && p.pdfs?.length
@@ -2502,26 +2539,98 @@ const App = {
     Lang.updateUI();
   },
 
+  paymentProofFormHtml(p) {
+    const w = this.marketState.walletInfo || {};
+    return `
+      <div class="alert info mt-12">
+        <span class="alert-icon">💳</span>
+        <span>
+          ${Lang.t('Pay using', 'الدفع باستخدام')} <strong>${this.esc(w.method || 'Mobile Wallet')}</strong>
+          ${w.number ? `: <strong>${this.esc(w.number)}</strong>` : ''}
+          ${w.name ? ` (${this.esc(w.name)})` : ''}
+          — ${Lang.t('then upload your payment proof below.', 'ثم قم برفع إثبات الدفع أدناه.')}
+        </span>
+      </div>
+      <div class="form-group mt-12">
+        <label class="form-label" data-en="Amount you paid" data-ar="المبلغ الذي دفعته">Amount you paid</label>
+        <input type="number" min="0" step="0.01" id="payAmount_${p.id}" data-en-placeholder="e.g. 199" data-ar-placeholder="مثل 199" placeholder="e.g. 199">
+      </div>
+      <div class="form-group">
+        <label class="form-label" data-en="Payment proof screenshot" data-ar="لقطة شاشة لإثبات الدفع">Payment proof screenshot</label>
+        <div class="upload-drop" onclick="document.getElementById('payProofInput_${p.id}').click()">
+          <span class="ud-icon">🧾</span>
+          <span class="ud-text" data-en="Tap to upload your receipt" data-ar="اضغط لتحميل الإيصال">Tap to upload your receipt</span>
+        </div>
+        <input type="file" id="payProofInput_${p.id}" accept="image/*" class="hidden" onchange="App.handlePayProofSelect(event, '${p.id}')">
+        <div id="payProofThumb_${p.id}" class="mt-8"></div>
+      </div>
+      <div id="payProofErr_${p.id}"></div>
+      <button class="btn btn-primary full mt-8" onclick="App.requestProductAccess('${p.id}')" data-en="📤 Submit payment proof" data-ar="📤 إرسال إثبات الدفع">📤 Submit payment proof</button>
+    `;
+  },
+
+  handlePayProofSelect(evt, productId) {
+    const file = evt.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      alert(Lang.t('Please choose an image file.', 'يرجى اختيار ملف صورة.'));
+      return;
+    }
+    // Kept well under Firestore's 1MB-per-document limit: base64 encoding
+    // adds ~33% overhead, and the request doc also carries other fields.
+    // A normal phone payment screenshot is typically well under this.
+    if (file.size > 700 * 1024) {
+      alert(Lang.t('Screenshot is too large. Please crop it to just the payment confirmation, or take a lower-resolution screenshot (under ~700KB).', 'لقطة الشاشة كبيرة جدًا. يرجى اقتصاصها لتظهر فقط تأكيد الدفع، أو أخذ لقطة بدقة أقل (أقل من 700 كيلوبايت تقريبًا).'));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      this.marketState.pendingProof = this.marketState.pendingProof || {};
+      this.marketState.pendingProof[productId] = reader.result;
+      const thumb = document.getElementById(`payProofThumb_${productId}`);
+      if (thumb) thumb.innerHTML = `<img src="${reader.result}" style="width:100%;max-width:200px;border-radius:var(--r-sm);border:1px solid var(--cream-200)">`;
+    };
+    reader.readAsDataURL(file);
+    evt.target.value = '';
+  },
+
   async requestProductAccess(productId) {
+    const amount = document.getElementById(`payAmount_${productId}`)?.value?.trim();
+    const image = this.marketState.pendingProof?.[productId];
+    const errEl = document.getElementById(`payProofErr_${productId}`);
+    if (!amount) {
+      if (errEl) this.showMsg(`payProofErr_${productId}`, 'danger', Lang.t('Please enter the amount you paid.', 'يرجى إدخال المبلغ الذي دفعته.'));
+      return;
+    }
+    if (!image) {
+      if (errEl) this.showMsg(`payProofErr_${productId}`, 'danger', Lang.t('Please upload your payment proof screenshot.', 'يرجى تحميل لقطة شاشة لإثبات الدفع.'));
+      return;
+    }
+    const btn = document.querySelector(`[onclick="App.requestProductAccess('${productId}')"]`);
+    this.setBtnLoad(btn, true, Lang.t('Submitting…','جاري الإرسال...'));
     try {
-      await Api.marketRequestAccess(productId).catch(() => {
-        // demo-mode fallback
+      const proof = { amount, image };
+      await Api.marketRequestAccess(productId, proof).catch(() => {
         const existing = Store._marketRequests.find(r => r.productId === productId && r.userId === this.user?.id && r.status === 'pending');
         if (!existing) {
           Store._marketRequests.push({
             id: 'req_' + Date.now(),
             productId, userId: this.user?.id,
             userName: `${this.user?.firstName||''} ${this.user?.lastName||''}`.trim(),
-            status: 'pending', createdAt: new Date().toISOString(),
+            status: 'pending', paymentProofImage: image, paymentAmount: amount,
+            createdAt: new Date().toISOString(),
           });
           Store.saveMarketRequests();
         }
       });
+      if (this.marketState.pendingProof) delete this.marketState.pendingProof[productId];
       await this.loadMarketData();
       this.renderProductDetail();
-      alert(Lang.t('Request sent! An admin will review it shortly.', 'تم إرسال الطلب! سيقوم المسؤول بمراجعته قريبًا.'));
+      alert(Lang.t('Payment proof sent! An admin will verify it shortly.', 'تم إرسال إثبات الدفع! سيقوم المسؤول بالتحقق منه قريبًا.'));
     } catch(e) {
-      alert(Lang.t('Error:','خطأ:') + ' ' + e.message);
+      if (errEl) this.showMsg(`payProofErr_${productId}`, 'danger', e.message);
+    } finally {
+      this.setBtnLoad(btn, false);
     }
   },
 
@@ -2551,6 +2660,28 @@ const App = {
       alert(Lang.t('Error:','خطأ:') + ' ' + e.message);
       const toggle = document.getElementById('marketGlobalLockToggle');
       if (toggle) toggle.checked = !locked;
+    }
+  },
+
+  async saveWalletSettings() {
+    const method = document.getElementById('walletMethod')?.value?.trim();
+    const number = document.getElementById('walletNumber')?.value?.trim();
+    const name = document.getElementById('walletName')?.value?.trim();
+    const btn = document.querySelector('[onclick="App.saveWalletSettings()"]');
+    if (!number) {
+      this.showMsg('walletErr', 'danger', Lang.t('Please enter a wallet number so clients know where to pay.', 'يرجى إدخال رقم المحفظة حتى يعرف العملاء أين يدفعون.'));
+      return;
+    }
+    this.setBtnLoad(btn, true, Lang.t('Saving…','جاري الحفظ...'));
+    try {
+      await Api.marketSetWalletInfo({ method, number, name });
+      await this.loadMarketData();
+      this.showMsg('walletErr', 'success', Lang.t('Payment settings saved.', 'تم حفظ إعدادات الدفع.'));
+      setTimeout(() => this.closeSheet(), 1200);
+    } catch(e) {
+      this.showMsg('walletErr', 'danger', e.message);
+    } finally {
+      this.setBtnLoad(btn, false);
     }
   },
 
@@ -2691,6 +2822,8 @@ const App = {
             <span class="prc-status ${statusClass}">${this.esc(r.status)}</span>
           </div>
           <div class="mrc-meta">${this.esc(r.userName||'')} · ${new Date(r.createdAt).toLocaleString()}</div>
+          ${r.paymentAmount ? `<div class="mrc-meta"><strong>${Lang.t('Claimed amount:','المبلغ المُعلن:')}</strong> ${this.esc(r.paymentAmount)}${product?.price ? ` (${Lang.t('listed price','السعر المعلن')}: ${this.esc(product.price)})` : ''}</div>` : ''}
+          ${r.paymentProofImage ? `<img src="${r.paymentProofImage}" style="width:100%;max-width:260px;border-radius:var(--r-sm);border:1px solid var(--cream-200);margin:6px 0;cursor:pointer" onclick="window.open(this.src,'_blank')">` : ''}
           ${r.status === 'pending' ? `
             <div class="mrc-actions">
               <button class="btn btn-sm btn-success" onclick="App.approveMarketRequest('${r.id}')">✅ ${Lang.t('Approve','موافقة')}</button>
@@ -2964,6 +3097,22 @@ const App = {
       </div>
       <div id="prodErr"></div>
       <button class="btn btn-primary full" onclick="App.submitNewProduct()" data-en="📤 Publish product" data-ar="📤 نشر المنتج">📤 Publish product</button>`;
+
+    if (name === 'marketPaymentSettings') {
+      const w = this.marketState.walletInfo || {};
+      return `
+        <div class="sheet-pill"></div>
+        <h2 data-en="💳 Payment Settings" data-ar="💳 إعدادات الدفع">💳 Payment Settings</h2>
+        <p class="sheet-sub" data-en="This is shown to clients so they know where to send payment before submitting proof." data-ar="يتم عرض هذا للعملاء لمعرفة مكان إرسال الدفع قبل تقديم الإثبات.">This is shown to clients so they know where to send payment before submitting proof.</p>
+        <div class="form-group"><label class="form-label" data-en="Payment method label" data-ar="تسمية طريقة الدفع">Payment method label</label>
+          <input id="walletMethod" value="${this.esc(w.method === 'Mobile Wallet' ? '' : w.method)}" data-en-placeholder="e.g. Vodafone Cash, Instapay" data-ar-placeholder="مثل فودافون كاش، انستاباي" placeholder="e.g. Vodafone Cash, Instapay"></div>
+        <div class="form-group"><label class="form-label" data-en="Wallet number / handle" data-ar="رقم المحفظة">Wallet number / handle</label>
+          <input id="walletNumber" value="${this.esc(w.number?.startsWith?.('Not set') ? '' : w.number)}" data-en-placeholder="e.g. 01012345678" data-ar-placeholder="مثل 01012345678" placeholder="e.g. 01012345678"></div>
+        <div class="form-group"><label class="form-label" data-en="Account holder name (optional)" data-ar="اسم صاحب الحساب (اختياري)">Account holder name (optional)</label>
+          <input id="walletName" value="${this.esc(w.name)}" data-en-placeholder="e.g. Ahmad Ali" data-ar-placeholder="مثل أحمد علي" placeholder="e.g. Ahmad Ali"></div>
+        <div id="walletErr"></div>
+        <button class="btn btn-primary full" onclick="App.saveWalletSettings()" data-en="Save payment settings" data-ar="حفظ إعدادات الدفع">Save payment settings</button>`;
+    }
 
     return '';
   },
